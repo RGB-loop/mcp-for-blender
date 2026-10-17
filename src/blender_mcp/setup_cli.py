@@ -22,6 +22,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    tomllib = None
+
 from .addon_manager import (
     blender_config_base,
     find_existing_addon_installs,
@@ -410,23 +415,49 @@ def _codex_home(env) -> Path:
     return Path(home) if home else Path.home() / ".codex"
 
 
-_TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", re.MULTILINE)
+_TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$", re.MULTILINE)
+_TOML_KEY = r"""(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)"""
+# `blender = { ... }` or `blender.command = ...` under [mcp_servers], and
+# `mcp_servers.blender... = ...` before the first table.
+_TOML_SERVER_KEY_RE = re.compile(rf"^[ \t]*({_TOML_KEY})[ \t]*(?:\.|=[ \t]*\{{)", re.MULTILINE)
+_TOML_ROOT_SERVER_KEY_RE = re.compile(rf"^[ \t]*mcp_servers[ \t]*\.[ \t]*({_TOML_KEY})[ \t]*[.=]", re.MULTILINE)
 
 
 def _codex_mcp_sections(text: str) -> dict[str, str]:
-    """{server name: its table body} for [mcp_servers.<name>] tables in config.toml.
+    """{server name: its settings as text} for the mcp_servers in config.toml.
 
-    A regex rather than a TOML parser: tomllib only arrived in Python 3.11,
-    and all this needs is each table's name and the text beneath it.
+    Read with tomllib where there is one (Python 3.11+). Python 3.10 falls back
+    to a regex that knows the forms a hand-written config uses: [mcp_servers.<name>]
+    tables, and inline tables or dotted keys under [mcp_servers] or at the top.
     """
-    headers = list(_TOML_HEADER_RE.finditer(text))
+    if tomllib is not None:
+        try:
+            servers = tomllib.loads(text).get("mcp_servers")
+        except tomllib.TOMLDecodeError:
+            pass
+        else:
+            return {name: json.dumps(body, default=str) for name, body in servers.items()} if isinstance(servers, dict) else {}
+
     sections: dict[str, str] = {}
+
+    def add(name: str, body: str) -> None:
+        name = name.strip().strip('"\'')
+        sections[name] = sections.get(name, "") + body
+
+    def add_keys(pattern: re.Pattern, body: str) -> None:
+        for m in pattern.finditer(body):
+            line_end = body.find("\n", m.end())
+            add(m.group(1), body[m.start():line_end if line_end >= 0 else len(body)] + "\n")
+
+    headers = list(_TOML_HEADER_RE.finditer(text))
+    add_keys(_TOML_ROOT_SERVER_KEY_RE, text[:headers[0].start()] if headers else text)
     for i, match in enumerate(headers):
         parts = [p.strip().strip('"\'') for p in re.split(r"\.(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", match.group(1))]
-        if len(parts) < 2 or parts[0] != "mcp_servers":
-            continue
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-        sections[parts[1]] = sections.get(parts[1], "") + text[match.end():end]
+        if parts == ["mcp_servers"]:
+            add_keys(_TOML_SERVER_KEY_RE, text[match.end():end])
+        elif len(parts) >= 2 and parts[0] == "mcp_servers":
+            add(parts[1], text[match.end():end])
     return sections
 
 
