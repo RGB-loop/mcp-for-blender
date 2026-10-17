@@ -173,6 +173,45 @@ def test_claude_code_uses_user_scope():
     assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, "mcp-for-blender"]
 
 
+def test_cli_clients_pick_a_free_name_beside_an_unrelated_blender(tmp_path):
+    claude = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    codex = Client("codex", "Codex", "codex", cli_path="/bin/codex")
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path), "CODEX_HOME": str(tmp_path)}
+    assert setup_cli._cli_key(claude, ClientState(NEW), env) == "blender"
+    assert setup_cli._cli_key(codex, ClientState(NEW), env) == "blender"
+
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    (tmp_path / "config.toml").write_text('[mcp_servers.blender]\ncommand = "my-own-blender-tool"\n')
+    assert setup_cli._cli_key(claude, ClientState(NEW), env) == "blender-2"
+    assert setup_cli._cli_key(codex, ClientState(NEW), env) == "blender-2"
+    [add] = setup_cli._cli_commands(claude, UVX, ClientState(NEW), "blender-2")
+    assert add[5] == "blender-2"
+
+    # Updating an old entry keeps its name.
+    assert setup_cli._cli_key(claude, ClientState(OUTDATED, "blender"), env) == "blender"
+    assert setup_cli._cli_key(codex, ClientState(OUTDATED, "blender"), env) == "blender"
+
+
+def test_cli_success_and_dry_run_report_the_name_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    ran = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: (ran.append(args), (True, ""))[1])
+
+    assert '--scope user blender-2 --' in setup_cli.describe_change(client, UVX, ClientState(NEW))
+    result = setup_cli.configure_cli_client(client, UVX, ClientState(NEW))
+    assert result.ok and result.key == "blender-2" and '"blender-2"' in result.message
+    assert [args[5] for args in ran] == ["blender-2"]
+
+
+def test_json_dry_run_reports_the_free_name(tmp_path):
+    path = tmp_path / "mcp.json"
+    _write(path, {"mcpServers": {"blender": {"command": "my-own-blender-tool"}}})
+    assert 'add "blender-2"' in setup_cli.describe_change(_client(path), UVX, ClientState(NEW))
+    assert 'add "blender"' in setup_cli.describe_change(_client(tmp_path / "none.json"), UVX, ClientState(NEW))
+
+
 # --- detection ---------------------------------------------------------------
 
 def test_detects_clients_by_config_folders(home):

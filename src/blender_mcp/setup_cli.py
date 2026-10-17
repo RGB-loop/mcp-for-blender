@@ -72,6 +72,7 @@ class ClientResult:
     ok: bool
     message: str
     backup: Path | None = None
+    key: str = SERVER_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -469,8 +470,30 @@ def _run_cli(args: list[str]) -> tuple[bool, str]:
     return proc.returncode == 0, output
 
 
-def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str]]:
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
+def _cli_server_names(client: Client, env=None) -> dict:
+    """The servers Claude Code or Codex already has at user scope, by name."""
+    env = os.environ if env is None else env
+    try:
+        if client.kind == "claude-code":
+            config, _ = read_json_config(_claude_json_path(env))
+            servers = config.get("mcpServers")
+            return servers if isinstance(servers, dict) else {}
+        return _codex_mcp_sections((_codex_home(env) / "config.toml").read_text(encoding="utf-8"))
+    except (ConfigError, OSError):
+        return {}
+
+
+def _cli_key(client: Client, state: ClientState, env=None) -> str:
+    """The name to configure under. A new entry mustn't reuse the name of an
+    unrelated server: `claude mcp add` refuses it and `codex mcp add` overwrites it."""
+    if state.status == OUTDATED:
+        return state.entry_key
+    return _free_key(_cli_server_names(client, env))
+
+
+def _cli_commands(client: Client, uvx: str, state: ClientState, key: str | None = None) -> list[list[str]]:
+    if key is None:
+        key = state.entry_key if state.status == OUTDATED else SERVER_NAME
     commands: list[list[str]] = []
     if client.kind == "claude-code":
         if state.status == OUTDATED:
@@ -485,15 +508,15 @@ def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str
 
 
 def configure_cli_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
-    for command in _cli_commands(client, uvx, state):
+    key = _cli_key(client, state)
+    for command in _cli_commands(client, uvx, state, key):
         ok, output = _run_cli(command)
         if not ok:
             shown = " ".join(Path(command[0]).name if i == 0 else a for i, a in enumerate(command))
             return ClientResult(client, False, f"`{shown}` failed: {output or 'no output'}")
     verb = "Updated" if state.status == OUTDATED else "Added"
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
     where = "user scope, all projects" if client.kind == "claude-code" else "~/.codex/config.toml"
-    return ClientResult(client, True, f'{verb} "{key}" ({where})')
+    return ClientResult(client, True, f'{verb} "{key}" ({where})', key=key)
 
 
 def client_state(client: Client) -> ClientState:
@@ -513,10 +536,17 @@ def configure_client(client: Client, uvx: str, state: ClientState) -> ClientResu
 def describe_change(client: Client, uvx: str, state: ClientState) -> str:
     """What configure_client would do, for --dry-run."""
     if client.kind == "json":
-        verb = f'update "{state.entry_key}"' if state.status == OUTDATED else f'add "{SERVER_NAME}"'
+        if state.status == OUTDATED:
+            verb = f'update "{state.entry_key}"'
+        else:
+            try:
+                servers = read_json_config(client.config_path)[0].get(_servers_key(client.style))
+            except (ConfigError, OSError):
+                servers = None
+            verb = f'add "{_free_key(servers if isinstance(servers, dict) else {})}"'
         return f"would {verb} in {client.config_path}"
     return "would run: " + " && ".join(
-        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state)
+        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state, _cli_key(client, state))
     )
 
 
@@ -824,10 +854,11 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
     for r in results:
         if r.ok:
             print(f"  • {r.client.restart_hint}")
-    if any(r.ok and r.client.kind == "codex" for r in results):
+    codex = next((r for r in results if r.ok and r.client.kind == "codex"), None)
+    if codex:
         print("  • Codex: the MCP for Blender plugin adds viewport branding and suggested prompts;")
         print("    see the README. Model generation can outlast Codex's 60s tool timeout; to raise it,")
-        print("    add `tool_timeout_sec = 600` under [mcp_servers.blender] in ~/.codex/config.toml.")
+        print(f"    add `tool_timeout_sec = 600` under [mcp_servers.{codex.key}] in ~/.codex/config.toml.")
     if addon and addon.installed:
         print("  • Open Blender. The addon starts its server on launch (MCP for Blender tab, press N).")
     print("  • Then ask your assistant to build something in Blender.")
